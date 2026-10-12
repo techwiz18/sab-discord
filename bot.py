@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import json
 import logging
 import os
 import random
@@ -87,6 +88,77 @@ if IDLE_MINUTES <= 0:
 if CHECK_INTERVAL_SECONDS < 30:
     log.warning("CHECK_INTERVAL_SECONDS=%s is very low; using 30s minimum.", CHECK_INTERVAL_SECONDS)
     CHECK_INTERVAL_SECONDS = 30
+
+# Boot defaults: what .env says. Command-set overrides persist in CONFIG_FILE
+# (gitignored, survives restarts/updates) and win over these until `sab reset`.
+_BOOT_IDLE_MINUTES = IDLE_MINUTES
+_BOOT_CHECK_INTERVAL = CHECK_INTERVAL_SECONDS
+CONFIG_FILE = os.getenv("CONFIG_FILE", "sab-config.json")
+MAX_THRESHOLD_MINUTES = 10080.0  # one week
+MIN_INTERVAL_SECONDS = 30
+MAX_INTERVAL_SECONDS = 86400  # one day
+_config_overrides: dict = {}
+
+
+def _load_config_overrides() -> dict:
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        log.warning("Ignoring unreadable %s (%s); using .env values.", CONFIG_FILE, exc)
+        return {}
+    if not isinstance(data, dict):
+        log.warning("Ignoring %s (not an object); using .env values.", CONFIG_FILE)
+        return {}
+    valid: dict = {}
+    idle = data.get("idle_minutes")
+    if isinstance(idle, (int, float)) and 0 < idle <= MAX_THRESHOLD_MINUTES:
+        valid["idle_minutes"] = float(idle)
+    elif idle is not None:
+        log.warning("Ignoring out-of-range idle_minutes in %s.", CONFIG_FILE)
+    interval = data.get("check_interval_seconds")
+    if isinstance(interval, int) and MIN_INTERVAL_SECONDS <= interval <= MAX_INTERVAL_SECONDS:
+        valid["check_interval_seconds"] = interval
+    elif interval is not None:
+        log.warning("Ignoring out-of-range check_interval_seconds in %s.", CONFIG_FILE)
+    return valid
+
+
+def _save_config_overrides() -> None:
+    tmp = CONFIG_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_config_overrides, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, CONFIG_FILE)
+    except OSError as exc:
+        log.warning("Could not persist %s: %s", CONFIG_FILE, exc)
+
+
+def _apply_config_overrides() -> None:
+    global IDLE_MINUTES, CHECK_INTERVAL_SECONDS
+    if "idle_minutes" in _config_overrides:
+        IDLE_MINUTES = _config_overrides["idle_minutes"]
+    if "check_interval_seconds" in _config_overrides:
+        CHECK_INTERVAL_SECONDS = _config_overrides["check_interval_seconds"]
+
+
+def _config_marker(current: float | int, boot: float | int) -> str:
+    return " (override — sab reset restores .env)" if current != boot else " (.env)"
+
+
+_config_overrides = _load_config_overrides()
+_apply_config_overrides()
+if _config_overrides:
+    log.info(
+        "Loaded command overrides from %s: %s (.env defaults: %sm/%ss)",
+        CONFIG_FILE,
+        _config_overrides,
+        _BOOT_IDLE_MINUTES,
+        _BOOT_CHECK_INTERVAL,
+    )
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -526,7 +598,8 @@ async def sab_status(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(
         f"Watching <#{CHANNEL_ID}> for <@&{ROLE_ID}>\n"
         f"Monitoring: {monitoring}\n"
-        f"Idle threshold: {IDLE_MINUTES:.0f}m (checked every {CHECK_INTERVAL_SECONDS}s)\n"
+        f"Idle threshold: {IDLE_MINUTES:g}m{_config_marker(IDLE_MINUTES, _BOOT_IDLE_MINUTES)}\n"
+        f"Check interval: {CHECK_INTERVAL_SECONDS}s{_config_marker(CHECK_INTERVAL_SECONDS, _BOOT_CHECK_INTERVAL)}\n"
         f"{activity} — {verdict}\n"
         f"Messages in rotation: {len(pool)} (source: {pool_source()})",
         ephemeral=True,
@@ -608,15 +681,11 @@ async def sab_resume(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("It wasn't paused — already active.", ephemeral=True)
 
 
-# --- runtime frequency config (takes effect immediately, .env wins on restart) ---
-
-MAX_THRESHOLD_MINUTES = 10080.0  # one week
-MIN_INTERVAL_SECONDS = 30
-MAX_INTERVAL_SECONDS = 86400  # one day
+# --- runtime frequency config (persisted to sab-config.json, .env wins on reset) ---
 
 
 @sab_group.command(name="threshold", description="Set idle minutes before pinging (managers only)")
-@app_commands.describe(minutes="Minutes of silence before a ping (boot default from .env)")
+@app_commands.describe(minutes="Minutes of silence before a ping (saved, survives restarts)")
 async def sab_threshold(interaction: discord.Interaction, minutes: float) -> None:
     if not await _require_manager(interaction):
         return
@@ -628,16 +697,17 @@ async def sab_threshold(interaction: discord.Interaction, minutes: float) -> Non
         return
     global IDLE_MINUTES
     IDLE_MINUTES = float(minutes)
-    log.info("Idle threshold set to %sm by %s (resets to .env on restart).", minutes, interaction.user)
+    _config_overrides["idle_minutes"] = IDLE_MINUTES
+    _save_config_overrides()
+    log.info("Idle threshold set to %sm by %s (saved to %s).", minutes, interaction.user, CONFIG_FILE)
     await interaction.response.send_message(
-        f"Idle threshold now {minutes:g}m — effective on the next check "
-        f"(.env default restored on restart).",
+        f"Idle threshold now {minutes:g}m — effective on the next check and saved.",
         ephemeral=True,
     )
 
 
 @sab_group.command(name="interval", description="Set how often the channel is checked (managers only)")
-@app_commands.describe(seconds="Seconds between checks, 30 minimum (boot default from .env)")
+@app_commands.describe(seconds="Seconds between checks, 30 minimum (saved, survives restarts)")
 async def sab_interval(interaction: discord.Interaction, seconds: int) -> None:
     if not await _require_manager(interaction):
         return
@@ -649,14 +719,45 @@ async def sab_interval(interaction: discord.Interaction, seconds: int) -> None:
         return
     global CHECK_INTERVAL_SECONDS
     CHECK_INTERVAL_SECONDS = seconds
+    _config_overrides["check_interval_seconds"] = seconds
+    _save_config_overrides()
     if inactivity_check.is_running():
         inactivity_check.change_interval(seconds=seconds)
-    log.info("Check interval set to %ss by %s (resets to .env on restart).", seconds, interaction.user)
+    log.info("Check interval set to %ss by %s (saved to %s).", seconds, interaction.user, CONFIG_FILE)
     await interaction.response.send_message(
-        f"Check interval now {seconds}s — effective immediately "
-        f"(.env default restored on restart).",
+        f"Check interval now {seconds}s — effective immediately and saved.",
         ephemeral=True,
     )
+
+
+@sab_group.command(name="reset", description="Forget saved overrides, restore .env values (managers only)")
+async def sab_reset(interaction: discord.Interaction) -> None:
+    if not await _require_manager(interaction):
+        return
+    global IDLE_MINUTES, CHECK_INTERVAL_SECONDS, _config_overrides
+    had_any = bool(_config_overrides)
+    _config_overrides = {}
+    try:
+        if os.path.exists(CONFIG_FILE):
+            os.remove(CONFIG_FILE)
+    except OSError as exc:
+        await interaction.response.send_message(f"Couldn't remove {CONFIG_FILE}: {exc}", ephemeral=True)
+        return
+    IDLE_MINUTES = _BOOT_IDLE_MINUTES
+    CHECK_INTERVAL_SECONDS = _BOOT_CHECK_INTERVAL
+    if inactivity_check.is_running():
+        inactivity_check.change_interval(seconds=CHECK_INTERVAL_SECONDS)
+    log.info("Config overrides cleared by %s; restored .env values.", interaction.user)
+    if had_any:
+        await interaction.response.send_message(
+            f"Overrides cleared — back to .env values ({_BOOT_IDLE_MINUTES:g}m / {_BOOT_CHECK_INTERVAL}s).",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            f"Nothing was overridden — already on .env values ({_BOOT_IDLE_MINUTES:g}m / {_BOOT_CHECK_INTERVAL}s).",
+            ephemeral=True,
+        )
 
 
 async def _sync_commands() -> None:

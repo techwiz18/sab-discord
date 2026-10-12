@@ -1,6 +1,8 @@
 .env
 # Local ping messages (auto-seeded from messages.example.txt, never overwritten by updates)
 messages.txt
+# Local command-set overrides (threshold/interval) — survives restarts and updates
+sab-config.json
 __pycache__/
 *.pyc
 .venv/
