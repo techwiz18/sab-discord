@@ -760,6 +760,37 @@ async def sab_reset(interaction: discord.Interaction) -> None:
         )
 
 
+@sab_group.command(name="emotes", description="List server emotes with codes for ping messages (managers only)")
+async def sab_emotes(interaction: discord.Interaction) -> None:
+    if not await _require_manager(interaction):
+        return
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "Use this inside a server, not in DMs.", ephemeral=True
+        )
+        return
+    try:
+        emotes = await guild.fetch_emojis()
+    except (discord.Forbidden, discord.HTTPException):
+        emotes = guild.emojis
+    if not emotes:
+        await interaction.response.send_message(
+            "This server has no custom emotes.", ephemeral=True
+        )
+        return
+    lines = [f"{e}  `{e}`" for e in emotes[:25]]
+    if len(emotes) > 25:
+        lines.append(f"…and {len(emotes) - 25} more")
+    body = "\n".join(lines)
+    if len(body) > 1800:
+        body = body[:1800] + "…"
+    await interaction.response.send_message(
+        "Paste a code into a ping message (messages.txt or messages add) and it renders as the emote:\n" + body,
+        ephemeral=True,
+    )
+
+
 async def _sync_commands() -> None:
     global _commands_synced
     if _commands_synced:
