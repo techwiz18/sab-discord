@@ -859,22 +859,51 @@ def _parse_setup_numbers(threshold_s: str, interval_s: str) -> tuple[float, int]
     return threshold, interval
 
 
+def _parse_setup_messages(raw: str) -> list[str]:
+    """Split the setup modal's message box: one ping message per line.
+
+    Blank lines are ignored. Lines starting with # are skipped, exactly like
+    messages.txt (so pasted file contents behave identically). Raises
+    ValueError naming the offending line if any message is too long.
+    """
+    messages = []
+    for lineno, line in enumerate((raw or "").splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if len(line) > MAX_MESSAGE_CHARS:
+            raise ValueError(
+                f"Message on line {lineno} is too long ({len(line)} chars, max {MAX_MESSAGE_CHARS})."
+            )
+        messages.append(line)
+    return messages
+
+
 def _setup_summary(
     channel_id: int,
     role_id: int,
     threshold: float,
     interval: int,
-    first_message: str | None,
+    new_messages: list[str] | None,
     role_is_everyone: bool,
     already_configured: bool,
+    env_pool_active: bool = False,
 ) -> str:
     lines = [
         "Here's what I'll do:",
         f"Watch <#{channel_id}> and ping <@&{role_id}> after {threshold:g}m of quiet.",
         f"Checking the channel every {interval}s.",
     ]
-    if first_message:
-        lines.append(f"First new ping message: {first_message[:200]}")
+    if new_messages:
+        preview = "\n".join(f"{i}. {m[:120]}" for i, m in enumerate(new_messages[:10], 1))
+        if len(new_messages) > 10:
+            preview += f"\n…and {len(new_messages) - 10} more"
+        lines.append(f"New ping messages ({len(new_messages)}):\n{preview}")
+        if env_pool_active:
+            lines.append(
+                "Note: PING_MESSAGES is set in .env and takes priority — these will be "
+                "saved to the file but stay unused until that's cleared."
+            )
     if role_is_everyone:
         lines.append("Note: that's @everyone — I need the Mention Everyone permission for it to notify.")
     if already_configured:
@@ -1014,11 +1043,11 @@ class SetupModal(discord.ui.Modal, title="Ping settings"):
             max_length=10,
         )
         self.message_input = discord.ui.TextInput(
-            label="First ping message (optional)",
+            label="Ping messages, one per line (optional)",
             style=discord.TextStyle.paragraph,
             required=False,
-            placeholder="Leave empty to keep the current messages",
-            max_length=MAX_MESSAGE_CHARS,
+            placeholder="One message per line — as many as you want. Blank lines (and # lines) are skipped.",
+            max_length=4000,
         )
         self.add_item(self.threshold_input)
         self.add_item(self.interval_input)
@@ -1029,18 +1058,19 @@ class SetupModal(discord.ui.Modal, title="Ping settings"):
             threshold, interval = _parse_setup_numbers(
                 self.threshold_input.value or "", self.interval_input.value or ""
             )
+            new_messages = _parse_setup_messages(self.message_input.value or "")
         except ValueError as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
-        first_message = (self.message_input.value or "").strip() or None
         summary = _setup_summary(
             self.channel_id,
             self.role_id,
             threshold,
             interval,
-            first_message,
+            new_messages or None,
             self.role_is_everyone,
             _is_configured(),
+            bool(PING_MESSAGES_RAW.strip()),
         )
         confirm = ConfirmView(
             self.setup_view.owner_id,
@@ -1048,7 +1078,7 @@ class SetupModal(discord.ui.Modal, title="Ping settings"):
             self.role_id,
             threshold,
             interval,
-            first_message,
+            new_messages,
         )
         try:
             await interaction.response.edit_message(content=summary, view=confirm)
@@ -1077,7 +1107,7 @@ class ConfirmView(discord.ui.View):
         role_id: int,
         threshold: float,
         interval: int,
-        first_message: str | None,
+        new_messages: list[str] | None,
     ):
         super().__init__(timeout=SETUP_TIMEOUT_SECONDS)
         self.owner_id = owner_id
@@ -1085,7 +1115,7 @@ class ConfirmView(discord.ui.View):
         self.role_id = role_id
         self.threshold = threshold
         self.interval = interval
-        self.first_message = first_message
+        self.new_messages = new_messages or []
 
     async def on_timeout(self) -> None:
         try:
@@ -1103,21 +1133,39 @@ class ConfirmView(discord.ui.View):
     ) -> None:
         if not await _check_setup_owner(interaction, self.owner_id):
             return
+        # All-or-nothing: check the message pool cap before saving anything.
+        if self.new_messages:
+            try:
+                existing = len(_read_message_lines(MESSAGES_FILE)) if os.path.exists(MESSAGES_FILE) else 0
+            except OSError:
+                existing = 0
+            if existing + len(self.new_messages) > MAX_FILE_MESSAGES:
+                await interaction.response.edit_message(
+                    content=(
+                        f"Too many messages: {existing} already saved, {len(self.new_messages)} new — "
+                        f"the pool holds {MAX_FILE_MESSAGES} max. Nothing was changed; "
+                        "run sab setup again with fewer lines."
+                    ),
+                    view=None,
+                )
+                return
         apply_setup(self.channel_id, self.role_id, self.threshold, self.interval)
         extra = ""
-        if self.first_message:
+        if self.new_messages:
             try:
-                count = add_file_message(self.first_message)
-                extra = f" Added your message as #{count}."
+                for message in self.new_messages:
+                    count = add_file_message(message)
+                extra = f" Added {len(self.new_messages)} message(s) — {count} in rotation now."
             except OSError as exc:
-                extra = f" Couldn't save your message ({exc}) — the rest is active."
+                extra = f" Couldn't save your messages ({exc}) — the rest is active."
         log.info(
-            "Setup completed by %s: channel=%s role=%s threshold=%sm interval=%ss",
+            "Setup completed by %s: channel=%s role=%s threshold=%sm interval=%ss messages=%d",
             interaction.user,
             self.channel_id,
             self.role_id,
             self.threshold,
             self.interval,
+            len(self.new_messages),
         )
         await interaction.response.edit_message(
             content=(
