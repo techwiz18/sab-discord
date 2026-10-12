@@ -19,11 +19,24 @@ import logging
 import os
 import sys
 
+# AMP captures stdout through a pipe, where CPython block-buffers by
+# default. Force line buffering first so startup errors are visible in
+# the AMP console instead of dying silently in the buffer.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+print("sab-discord: starting...", flush=True)
+
 import discord
 from discord.ext import tasks
 from dotenv import load_dotenv
 
+print(f"sab-discord: imports ok, cwd={os.getcwd()}", flush=True)
 load_dotenv()
+print("sab-discord: .env loaded (if present)", flush=True)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -36,6 +49,9 @@ log = logging.getLogger("sab-discord")
 def get_env(name: str, default: str | None = None, required: bool = False) -> str | None:
     value = os.getenv(name, default)
     if required and not value:
+        msg = f"sab-discord: FATAL: missing required env var: {name}"
+        print(msg, flush=True)
+        print(msg, file=sys.stderr, flush=True)
         log.error("Missing required env var: %s", name)
         sys.exit(1)
     return value
