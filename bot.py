@@ -61,8 +61,26 @@ def get_env(name: str, default: str | None = None, required: bool = False) -> st
 
 
 TOKEN = get_env("DISCORD_TOKEN", required=True)
-CHANNEL_ID = int(get_env("CHANNEL_ID", required=True))  # type: ignore[arg-type]
-ROLE_ID = int(get_env("ROLE_ID", required=True))  # type: ignore[arg-type]
+
+
+def _optional_id(name: str) -> int | None:
+    """Read an optional Discord ID: blank/missing means unconfigured (dormant)."""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("Ignoring invalid %s=%r (not a number); treating as blank.", name, raw)
+        return None
+    if value <= 0:
+        log.warning("Ignoring invalid %s=%r (not positive); treating as blank.", name, raw)
+        return None
+    return value
+
+
+CHANNEL_ID = _optional_id("CHANNEL_ID")
+ROLE_ID = _optional_id("ROLE_ID")
 GUILD_ID_RAW = os.getenv("GUILD_ID")
 GUILD_ID = int(GUILD_ID_RAW) if GUILD_ID_RAW else None
 
@@ -93,6 +111,8 @@ if CHECK_INTERVAL_SECONDS < 30:
 # (gitignored, survives restarts/updates) and win over these until `sab reset`.
 _BOOT_IDLE_MINUTES = IDLE_MINUTES
 _BOOT_CHECK_INTERVAL = CHECK_INTERVAL_SECONDS
+_BOOT_CHANNEL_ID = CHANNEL_ID
+_BOOT_ROLE_ID = ROLE_ID
 CONFIG_FILE = os.getenv("CONFIG_FILE", "sab-config.json")
 MAX_THRESHOLD_MINUTES = 10080.0  # one week
 MIN_INTERVAL_SECONDS = 30
@@ -123,6 +143,12 @@ def _load_config_overrides() -> dict:
         valid["check_interval_seconds"] = interval
     elif interval is not None:
         log.warning("Ignoring out-of-range check_interval_seconds in %s.", CONFIG_FILE)
+    for key in ("channel_id", "role_id"):
+        value = data.get(key)
+        if isinstance(value, int) and value > 0:
+            valid[key] = value
+        elif value is not None:
+            log.warning("Ignoring invalid %s in %s.", key, CONFIG_FILE)
     return valid
 
 
@@ -138,26 +164,43 @@ def _save_config_overrides() -> None:
 
 
 def _apply_config_overrides() -> None:
-    global IDLE_MINUTES, CHECK_INTERVAL_SECONDS
+    global IDLE_MINUTES, CHECK_INTERVAL_SECONDS, CHANNEL_ID, ROLE_ID
     if "idle_minutes" in _config_overrides:
         IDLE_MINUTES = _config_overrides["idle_minutes"]
     if "check_interval_seconds" in _config_overrides:
         CHECK_INTERVAL_SECONDS = _config_overrides["check_interval_seconds"]
+    if "channel_id" in _config_overrides:
+        CHANNEL_ID = _config_overrides["channel_id"]
+    if "role_id" in _config_overrides:
+        ROLE_ID = _config_overrides["role_id"]
+
+
+def _set_override(key: str, value: float | int) -> None:
+    """Persist one override key and apply it to the matching global."""
+    _config_overrides[key] = value
+    _save_config_overrides()
+    _apply_config_overrides()
 
 
 def _config_marker(current: float | int, boot: float | int) -> str:
     return " (override — sab reset restores .env)" if current != boot else " (.env)"
 
 
+def _is_configured() -> bool:
+    return CHANNEL_ID is not None and ROLE_ID is not None
+
+
 _config_overrides = _load_config_overrides()
 _apply_config_overrides()
 if _config_overrides:
     log.info(
-        "Loaded command overrides from %s: %s (.env defaults: %sm/%ss)",
+        "Loaded command overrides from %s: %s (.env defaults: %sm/%ss/channel=%s/role=%s)",
         CONFIG_FILE,
         _config_overrides,
         _BOOT_IDLE_MINUTES,
         _BOOT_CHECK_INTERVAL,
+        _BOOT_CHANNEL_ID,
+        _BOOT_ROLE_ID,
     )
 
 intents = discord.Intents.default()
@@ -188,20 +231,25 @@ async def on_ready() -> None:
     assert client.user is not None
     log.info("Logged in as %s (id=%s)", client.user, client.user.id)
 
-    channel = client.get_channel(CHANNEL_ID)
-    if channel is None:
-        try:
-            channel = await client.fetch_channel(CHANNEL_ID)
-        except (discord.NotFound, discord.Forbidden) as exc:
-            log.error("Cannot access CHANNEL_ID=%s: %s", CHANNEL_ID, exc)
-            return
-    log.info(
-        "Watching channel_id=%s idle_threshold=%.1fm check_every=%ss role_id=%s",
-        CHANNEL_ID,
-        IDLE_MINUTES,
-        CHECK_INTERVAL_SECONDS,
-        ROLE_ID,
-    )
+    channel = None
+    if _is_configured():
+        assert CHANNEL_ID is not None
+        channel = client.get_channel(CHANNEL_ID)
+        if channel is None:
+            try:
+                channel = await client.fetch_channel(CHANNEL_ID)
+            except (discord.NotFound, discord.Forbidden) as exc:
+                log.error("Cannot access CHANNEL_ID=%s: %s", CHANNEL_ID, exc)
+                return
+        log.info(
+            "Watching channel_id=%s idle_threshold=%.1fm check_every=%ss role_id=%s",
+            CHANNEL_ID,
+            IDLE_MINUTES,
+            CHECK_INTERVAL_SECONDS,
+            ROLE_ID,
+        )
+    else:
+        log.info("Not configured (blank channel/role) — dormant. Point me at a channel with sab setup.")
     if GUILD_ID is not None and client.get_guild(GUILD_ID) is None:
         log.warning("GUILD_ID=%s not found in cache; continuing with channel-only mode.", GUILD_ID)
     log.info("Loaded %d ping message(s).", len(load_messages()))
@@ -222,6 +270,11 @@ async def inactivity_check() -> None:
         log.debug("Monitoring paused; skipping check.")
         return
 
+    if not _is_configured():
+        log.debug("Not configured; skipping check.")
+        return
+
+    assert CHANNEL_ID is not None
     try:
         channel = client.get_channel(CHANNEL_ID)
         if channel is None:
@@ -567,6 +620,16 @@ sab_group.add_command(msg_group)
 async def sab_status(interaction: discord.Interaction) -> None:
     if not await _require_manager(interaction):
         return
+    pool = load_messages()
+    _, monitoring = pause_state()
+    if not _is_configured():
+        await interaction.response.send_message(
+            f"Monitoring: {monitoring} but not watching anything — dormant.\n"
+            f"Run sab setup to point me at a channel and role.\n"
+            f"Messages in rotation: {len(pool)} (source: {pool_source()})",
+            ephemeral=True,
+        )
+        return
     now = datetime.datetime.now(datetime.timezone.utc)
     try:
         channel = client.get_channel(CHANNEL_ID)
@@ -596,7 +659,7 @@ async def sab_status(interaction: discord.Interaction) -> None:
         else:
             verdict = "would ping on the next check" if mins >= IDLE_MINUTES else "no ping due yet"
     await interaction.response.send_message(
-        f"Watching <#{CHANNEL_ID}> for <@&{ROLE_ID}>\n"
+        f"Watching <#{CHANNEL_ID}>{_config_marker(CHANNEL_ID or 0, _BOOT_CHANNEL_ID or 0)} for <@&{ROLE_ID}>{_config_marker(ROLE_ID or 0, _BOOT_ROLE_ID or 0)}\n"
         f"Monitoring: {monitoring}\n"
         f"Idle threshold: {IDLE_MINUTES:g}m{_config_marker(IDLE_MINUTES, _BOOT_IDLE_MINUTES)}\n"
         f"Check interval: {CHECK_INTERVAL_SECONDS}s{_config_marker(CHECK_INTERVAL_SECONDS, _BOOT_CHECK_INTERVAL)}\n"
@@ -697,8 +760,7 @@ async def sab_threshold(interaction: discord.Interaction, minutes: float) -> Non
         return
     global IDLE_MINUTES
     IDLE_MINUTES = float(minutes)
-    _config_overrides["idle_minutes"] = IDLE_MINUTES
-    _save_config_overrides()
+    _set_override("idle_minutes", IDLE_MINUTES)
     log.info("Idle threshold set to %sm by %s (saved to %s).", minutes, interaction.user, CONFIG_FILE)
     await interaction.response.send_message(
         f"Idle threshold now {minutes:g}m — effective on the next check and saved.",
@@ -719,8 +781,7 @@ async def sab_interval(interaction: discord.Interaction, seconds: int) -> None:
         return
     global CHECK_INTERVAL_SECONDS
     CHECK_INTERVAL_SECONDS = seconds
-    _config_overrides["check_interval_seconds"] = seconds
-    _save_config_overrides()
+    _set_override("check_interval_seconds", seconds)
     if inactivity_check.is_running():
         inactivity_check.change_interval(seconds=seconds)
     log.info("Check interval set to %ss by %s (saved to %s).", seconds, interaction.user, CONFIG_FILE)
@@ -734,7 +795,7 @@ async def sab_interval(interaction: discord.Interaction, seconds: int) -> None:
 async def sab_reset(interaction: discord.Interaction) -> None:
     if not await _require_manager(interaction):
         return
-    global IDLE_MINUTES, CHECK_INTERVAL_SECONDS, _config_overrides
+    global IDLE_MINUTES, CHECK_INTERVAL_SECONDS, CHANNEL_ID, ROLE_ID, _config_overrides
     had_any = bool(_config_overrides)
     _config_overrides = {}
     try:
@@ -745,19 +806,348 @@ async def sab_reset(interaction: discord.Interaction) -> None:
         return
     IDLE_MINUTES = _BOOT_IDLE_MINUTES
     CHECK_INTERVAL_SECONDS = _BOOT_CHECK_INTERVAL
+    CHANNEL_ID = _BOOT_CHANNEL_ID
+    ROLE_ID = _BOOT_ROLE_ID
     if inactivity_check.is_running():
         inactivity_check.change_interval(seconds=CHECK_INTERVAL_SECONDS)
     log.info("Config overrides cleared by %s; restored .env values.", interaction.user)
+    if _is_configured():
+        watching = f"Watching <#{CHANNEL_ID}> for <@&{ROLE_ID}>."
+    else:
+        watching = "No channel/role in .env — dormant until sab setup."
     if had_any:
         await interaction.response.send_message(
-            f"Overrides cleared — back to .env values ({_BOOT_IDLE_MINUTES:g}m / {_BOOT_CHECK_INTERVAL}s).",
+            f"Overrides cleared — back to .env values ({_BOOT_IDLE_MINUTES:g}m / {_BOOT_CHECK_INTERVAL}s). {watching}",
             ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
     else:
         await interaction.response.send_message(
-            f"Nothing was overridden — already on .env values ({_BOOT_IDLE_MINUTES:g}m / {_BOOT_CHECK_INTERVAL}s).",
+            f"Nothing was overridden — already on .env values ({_BOOT_IDLE_MINUTES:g}m / {_BOOT_CHECK_INTERVAL}s). {watching}",
             ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
+
+
+# --- guided onboarding: sab setup (one command instead of many) ---
+
+SETUP_TIMEOUT_SECONDS = 300
+
+
+def _parse_setup_numbers(threshold_s: str, interval_s: str) -> tuple[float, int]:
+    """Parse the setup modal's number fields; blank keeps the current value."""
+    threshold_s = (threshold_s or "").strip()
+    interval_s = (interval_s or "").strip()
+    if threshold_s:
+        try:
+            threshold = float(threshold_s)
+        except ValueError:
+            raise ValueError(f"Quiet minutes must be a number (got {threshold_s!r}).")
+        if not 0 < threshold <= MAX_THRESHOLD_MINUTES:
+            raise ValueError(f"Quiet minutes must be over 0 and at most {MAX_THRESHOLD_MINUTES:.0f}.")
+    else:
+        threshold = IDLE_MINUTES
+    if interval_s:
+        try:
+            interval = int(interval_s)
+        except ValueError:
+            raise ValueError(f"Check seconds must be a whole number (got {interval_s!r}).")
+        if not MIN_INTERVAL_SECONDS <= interval <= MAX_INTERVAL_SECONDS:
+            raise ValueError(f"Check seconds must be {MIN_INTERVAL_SECONDS}-{MAX_INTERVAL_SECONDS}.")
+    else:
+        interval = CHECK_INTERVAL_SECONDS
+    return threshold, interval
+
+
+def _setup_summary(
+    channel_id: int,
+    role_id: int,
+    threshold: float,
+    interval: int,
+    first_message: str | None,
+    role_is_everyone: bool,
+    already_configured: bool,
+) -> str:
+    lines = [
+        "Here's what I'll do:",
+        f"Watch <#{channel_id}> and ping <@&{role_id}> after {threshold:g}m of quiet.",
+        f"Checking the channel every {interval}s.",
+    ]
+    if first_message:
+        lines.append(f"First new ping message: {first_message[:200]}")
+    if role_is_everyone:
+        lines.append("Note: that's @everyone — I need the Mention Everyone permission for it to notify.")
+    if already_configured:
+        lines.append("This replaces the current channel/role.")
+    lines.append("Start watching?")
+    return "\n".join(lines)
+
+
+def apply_setup(channel_id: int, role_id: int, threshold: float, interval: int) -> None:
+    """Persist a full setup and activate it immediately."""
+    global IDLE_MINUTES, CHECK_INTERVAL_SECONDS, CHANNEL_ID, ROLE_ID
+    CHANNEL_ID = channel_id
+    ROLE_ID = role_id
+    IDLE_MINUTES = float(threshold)
+    CHECK_INTERVAL_SECONDS = interval
+    _config_overrides["channel_id"] = channel_id
+    _config_overrides["role_id"] = role_id
+    _config_overrides["idle_minutes"] = IDLE_MINUTES
+    _config_overrides["check_interval_seconds"] = interval
+    _save_config_overrides()
+    if inactivity_check.is_running():
+        inactivity_check.change_interval(seconds=interval)
+
+
+async def _check_setup_owner(interaction: discord.Interaction, owner_id: int) -> bool:
+    if interaction.user.id == owner_id:
+        return True
+    await interaction.response.send_message(
+        "Only the person who ran setup can use these.", ephemeral=True
+    )
+    return False
+
+
+class SetupChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, view_ref: SetupView):
+        super().__init__(
+            placeholder="Pick the channel to watch",
+            channel_types=[discord.ChannelType.text],
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
+        self.view_ref = view_ref
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await _check_setup_owner(interaction, self.view_ref.owner_id):
+            return
+        self.view_ref.channel_id = self.values[0].id
+        await self.view_ref.refresh(interaction)
+
+
+class SetupRoleSelect(discord.ui.RoleSelect):
+    def __init__(self, view_ref: SetupView):
+        super().__init__(
+            placeholder="Pick the role to ping",
+            min_values=1,
+            max_values=1,
+            row=1,
+        )
+        self.view_ref = view_ref
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await _check_setup_owner(interaction, self.view_ref.owner_id):
+            return
+        role = self.values[0]
+        self.view_ref.role_id = role.id
+        self.view_ref.role_is_everyone = bool(role.is_default())
+        await self.view_ref.refresh(interaction)
+
+
+class SetupView(discord.ui.View):
+    """Step 1: pick channel + role with native menus (no IDs to type)."""
+
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=SETUP_TIMEOUT_SECONDS)
+        self.owner_id = owner_id
+        self.channel_id: int | None = None
+        self.role_id: int | None = None
+        self.role_is_everyone = False
+        self.add_item(SetupChannelSelect(self))
+        self.add_item(SetupRoleSelect(self))
+
+    async def on_timeout(self) -> None:
+        try:
+            if self.message is not None:
+                await self.message.edit(content="Setup timed out — run sab setup again.", view=None)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    async def refresh(self, interaction: discord.Interaction) -> None:
+        picked = []
+        if self.channel_id is not None:
+            picked.append(f"Channel: <#{self.channel_id}>")
+        if self.role_id is not None:
+            picked.append(f"Role: <@&{self.role_id}>")
+        body = "\n".join(picked) if picked else "Nothing picked yet."
+        await interaction.response.edit_message(
+            content=f"Step 1 — pick what to watch (only you can see this):\n{body}",
+            view=self,
+        )
+
+    @discord.ui.button(label="Continue", style=discord.ButtonStyle.primary, row=2)
+    async def continue_setup(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not await _check_setup_owner(interaction, self.owner_id):
+            return
+        if self.channel_id is None or self.role_id is None:
+            await interaction.response.send_message(
+                "Pick both a channel and a role first.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(
+            SetupModal(self, self.channel_id, self.role_id, self.role_is_everyone)
+        )
+
+
+class SetupModal(discord.ui.Modal, title="Ping settings"):
+    """Step 2: numbers + optional first message (prefilled with current values)."""
+
+    def __init__(
+        self, view: SetupView, channel_id: int, role_id: int, role_is_everyone: bool
+    ):
+        super().__init__(timeout=SETUP_TIMEOUT_SECONDS)
+        self.setup_view = view
+        self.channel_id = channel_id
+        self.role_id = role_id
+        self.role_is_everyone = role_is_everyone
+        self.threshold_input = discord.ui.TextInput(
+            label="Minutes of quiet before a ping",
+            default=f"{IDLE_MINUTES:g}",
+            max_length=10,
+        )
+        self.interval_input = discord.ui.TextInput(
+            label="Seconds between checks (30+)",
+            default=str(CHECK_INTERVAL_SECONDS),
+            max_length=10,
+        )
+        self.message_input = discord.ui.TextInput(
+            label="First ping message (optional)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            placeholder="Leave empty to keep the current messages",
+            max_length=MAX_MESSAGE_CHARS,
+        )
+        self.add_item(self.threshold_input)
+        self.add_item(self.interval_input)
+        self.add_item(self.message_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            threshold, interval = _parse_setup_numbers(
+                self.threshold_input.value or "", self.interval_input.value or ""
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        first_message = (self.message_input.value or "").strip() or None
+        summary = _setup_summary(
+            self.channel_id,
+            self.role_id,
+            threshold,
+            interval,
+            first_message,
+            self.role_is_everyone,
+            _is_configured(),
+        )
+        confirm = ConfirmView(
+            self.setup_view.owner_id,
+            self.channel_id,
+            self.role_id,
+            threshold,
+            interval,
+            first_message,
+        )
+        try:
+            await interaction.response.edit_message(content=summary, view=confirm)
+        except (discord.Forbidden, discord.HTTPException):
+            await interaction.followup.send(summary, view=confirm, ephemeral=True)
+
+    async def on_error(
+        self, interaction: discord.Interaction, error: Exception
+    ) -> None:
+        log.warning("Setup modal error: %s", error)
+        try:
+            await interaction.response.send_message(
+                "Something went wrong — run sab setup again.", ephemeral=True
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+
+class ConfirmView(discord.ui.View):
+    """Step 3: confirm (or cancel) — nothing is saved until confirmed."""
+
+    def __init__(
+        self,
+        owner_id: int,
+        channel_id: int,
+        role_id: int,
+        threshold: float,
+        interval: int,
+        first_message: str | None,
+    ):
+        super().__init__(timeout=SETUP_TIMEOUT_SECONDS)
+        self.owner_id = owner_id
+        self.channel_id = channel_id
+        self.role_id = role_id
+        self.threshold = threshold
+        self.interval = interval
+        self.first_message = first_message
+
+    async def on_timeout(self) -> None:
+        try:
+            if self.message is not None:
+                await self.message.edit(
+                    content="Setup timed out — nothing was changed. Run sab setup again.",
+                    view=None,
+                )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    @discord.ui.button(label="Start watching", style=discord.ButtonStyle.success)
+    async def confirm(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not await _check_setup_owner(interaction, self.owner_id):
+            return
+        apply_setup(self.channel_id, self.role_id, self.threshold, self.interval)
+        extra = ""
+        if self.first_message:
+            try:
+                count = add_file_message(self.first_message)
+                extra = f" Added your message as #{count}."
+            except OSError as exc:
+                extra = f" Couldn't save your message ({exc}) — the rest is active."
+        log.info(
+            "Setup completed by %s: channel=%s role=%s threshold=%sm interval=%ss",
+            interaction.user,
+            self.channel_id,
+            self.role_id,
+            self.threshold,
+            self.interval,
+        )
+        await interaction.response.edit_message(
+            content=(
+                f"Done — watching <#{self.channel_id}> for <@&{self.role_id}>: "
+                f"ping after {self.threshold:g}m of quiet, checked every {self.interval}s.{extra}"
+            ),
+            view=None,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not await _check_setup_owner(interaction, self.owner_id):
+            return
+        await interaction.response.edit_message(
+            content="Setup cancelled — nothing was changed.", view=None
+        )
+
+
+@sab_group.command(name="setup", description="Walk through setup step by step")
+async def sab_setup(interaction: discord.Interaction) -> None:
+    if not await _require_manager(interaction):
+        return
+    view = SetupView(owner_id=interaction.user.id)
+    await interaction.response.send_message(
+        "Step 1 — pick what to watch (only you can see this):\nNothing picked yet.",
+        view=view,
+        ephemeral=True,
+    )
 
 
 @sab_group.command(name="emotes", description="See emotes you can use in messages")
