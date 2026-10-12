@@ -32,6 +32,7 @@ except Exception:
 print("sab-discord: starting...", flush=True)
 
 import discord
+from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
 
@@ -136,6 +137,7 @@ async def on_ready() -> None:
     if not inactivity_check.is_running():
         inactivity_check.change_interval(seconds=CHECK_INTERVAL_SECONDS)
         inactivity_check.start()
+    await _sync_commands()
 
 
 @tasks.loop(seconds=300)
@@ -323,6 +325,212 @@ def pick_message() -> str:
 @inactivity_check.before_loop
 async def _wait_ready() -> None:
     await client.wait_until_ready()
+
+
+# --- slash-command configuration (no website needed) ---
+
+tree = app_commands.CommandTree(client)
+_commands_synced = False
+
+MAX_FILE_MESSAGES = int(os.getenv("MAX_FILE_MESSAGES", "50"))
+MAX_MESSAGE_CHARS = 1500
+_manager_role_ids = {
+    int(x) for x in os.getenv("MANAGER_ROLE_IDS", "").replace(",", " ").split() if x.strip().isdigit()
+}
+
+
+def pool_source() -> str:
+    """Where the current pool comes from (for /messages list and /ping-status)."""
+    if PING_MESSAGES_RAW.strip():
+        return "PING_MESSAGES in .env"
+    _ensure_messages_file()
+    try:
+        if _read_message_lines(MESSAGES_FILE):
+            return MESSAGES_FILE
+    except OSError:
+        pass
+    return "PING_TEXT fallback in .env"
+
+
+def _is_manager(user: discord.abc.User) -> bool:
+    if not isinstance(user, discord.Member):
+        return False
+    if _manager_role_ids and any(r.id in _manager_role_ids for r in user.roles):
+        return True
+    return bool(user.guild_permissions.administrator)
+
+
+async def _require_manager(interaction: discord.Interaction) -> bool:
+    if _is_manager(interaction.user):
+        return True
+    await interaction.response.send_message(
+        "Only server managers can use this command.", ephemeral=True
+    )
+    return False
+
+
+async def _deny_when_env_pool(interaction: discord.Interaction) -> bool:
+    """Stop file edits that would be silently shadowed by PING_MESSAGES."""
+    if PING_MESSAGES_RAW.strip():
+        await interaction.response.send_message(
+            "PING_MESSAGES is set in .env and takes priority, so file changes "
+            "would have no effect. Clear it (and restart the bot) to manage "
+            "messages with these commands.",
+            ephemeral=True,
+        )
+        return True
+    return False
+
+
+def add_file_message(text: str) -> int:
+    """Append a message to the file pool; return the new message count."""
+    _ensure_messages_file()
+    with open(MESSAGES_FILE, "r", encoding="utf-8") as f:
+        content = f.read()
+    if content and not content.endswith("\n"):
+        content += "\n"
+    with open(MESSAGES_FILE, "w", encoding="utf-8") as f:
+        f.write(content + text.strip() + "\n")
+    return len(_read_message_lines(MESSAGES_FILE))
+
+
+def remove_file_message(index1: int) -> str:
+    """Remove the 1-based Nth message from the file pool; return removed text."""
+    _ensure_messages_file()
+    with open(MESSAGES_FILE, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    positions = [i for i, line in enumerate(lines) if line.strip() and not line.strip().startswith("#")]
+    if not 1 <= index1 <= len(positions):
+        raise IndexError(f"There are {len(positions)} message(s); pick 1-{len(positions)}.")
+    removed = lines.pop(positions[index1 - 1]).strip()
+    with open(MESSAGES_FILE, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    return removed
+
+
+msg_group = app_commands.Group(name="messages", description="View and manage the random ping messages")
+
+
+@msg_group.command(name="list", description="Show the ping messages currently in rotation")
+async def messages_list(interaction: discord.Interaction) -> None:
+    pool = load_messages()
+    body = "\n".join(f"{i}. {m}" for i, m in enumerate(pool, 1))
+    if len(body) > 1800:
+        body = body[:1800] + "…"
+    await interaction.response.send_message(
+        f"Ping messages ({len(pool)}, source: {pool_source()}):\n{body}",
+        ephemeral=True,
+    )
+
+
+@msg_group.command(name="add", description="Add a ping message (managers only)")
+@app_commands.describe(text="The message to add to the rotation")
+async def messages_add(interaction: discord.Interaction, text: str) -> None:
+    if not await _require_manager(interaction):
+        return
+    if await _deny_when_env_pool(interaction):
+        return
+    text = text.strip()
+    if not text:
+        await interaction.response.send_message("Message can't be blank.", ephemeral=True)
+        return
+    if len(text) > MAX_MESSAGE_CHARS:
+        await interaction.response.send_message(
+            f"Too long ({len(text)} chars, max {MAX_MESSAGE_CHARS}).", ephemeral=True
+        )
+        return
+    try:
+        count = add_file_message(text)
+    except OSError as exc:
+        await interaction.response.send_message(f"Couldn't save: {exc}", ephemeral=True)
+        return
+    if count > MAX_FILE_MESSAGES:
+        try:
+            remove_file_message(count)  # roll back
+        except (OSError, IndexError):
+            pass
+        await interaction.response.send_message(
+            f"Pool is full ({MAX_FILE_MESSAGES} messages max).", ephemeral=True
+        )
+        return
+    await interaction.response.send_message(
+        f"Added as message #{count} — live on the next ping, no restart needed.",
+        ephemeral=True,
+    )
+
+
+@msg_group.command(name="remove", description="Remove a ping message by number (managers only)")
+@app_commands.describe(index="The message number from /messages list")
+async def messages_remove(interaction: discord.Interaction, index: int) -> None:
+    if not await _require_manager(interaction):
+        return
+    if await _deny_when_env_pool(interaction):
+        return
+    try:
+        removed = remove_file_message(index)
+    except IndexError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+    except OSError as exc:
+        await interaction.response.send_message(f"Couldn't save: {exc}", ephemeral=True)
+        return
+    await interaction.response.send_message(f"Removed #{index}: {removed[:200]}", ephemeral=True)
+
+
+tree.add_command(msg_group)
+
+
+@tree.command(name="ping-status", description="Show the inactivity pinger's status")
+async def ping_status(interaction: discord.Interaction) -> None:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        channel = client.get_channel(CHANNEL_ID)
+        if channel is None:
+            channel = await client.fetch_channel(CHANNEL_ID)
+        if not isinstance(channel, discord.TextChannel):
+            raise discord.NotFound("watched channel", "not a text channel")
+        last_human = await find_last_human_message(channel, client.user.id if client.user else None)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+        await interaction.response.send_message(
+            f"Can't read the watched channel: {exc}", ephemeral=True
+        )
+        return
+    pool = load_messages()
+    if last_human is None:
+        activity = "no human messages found — channel counts as idle"
+        verdict = "would ping on the next check"
+    else:
+        ts = last_human.created_at
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=datetime.timezone.utc)
+        mins = idle_seconds(ts, now) / 60
+        activity = f"last activity {mins:.0f}m ago by {last_human.author}"
+        verdict = "would ping on the next check" if mins >= IDLE_MINUTES else "no ping due yet"
+    await interaction.response.send_message(
+        f"Watching <#{CHANNEL_ID}> for <@&{ROLE_ID}>\n"
+        f"Idle threshold: {IDLE_MINUTES:.0f}m (checked every {CHECK_INTERVAL_SECONDS}s)\n"
+        f"{activity} — {verdict}\n"
+        f"Messages in rotation: {len(pool)} (source: {pool_source()})",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+async def _sync_commands() -> None:
+    global _commands_synced
+    if _commands_synced:
+        return
+    try:
+        if GUILD_ID is not None:
+            # Guild-scoped sync lands instantly (global sync can take up to an hour).
+            synced = await tree.sync(guild=discord.Object(id=GUILD_ID))
+            log.info("Synced %d command(s) to guild %s.", len(synced), GUILD_ID)
+        else:
+            synced = await tree.sync()
+            log.info("Synced %d command(s) globally.", len(synced))
+    except (discord.HTTPException, discord.Forbidden) as exc:
+        log.warning("Slash command sync failed: %s", exc)
+    _commands_synced = True
 
 
 def main() -> None:
