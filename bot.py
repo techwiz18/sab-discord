@@ -145,6 +145,11 @@ async def inactivity_check() -> None:
     assert client.user is not None
     now = datetime.datetime.now(datetime.timezone.utc)
 
+    paused, _ = pause_state()
+    if paused:
+        log.debug("Monitoring paused; skipping check.")
+        return
+
     try:
         channel = client.get_channel(CHANNEL_ID)
         if channel is None:
@@ -504,24 +509,103 @@ async def sab_status(interaction: discord.Interaction) -> None:
         )
         return
     pool = load_messages()
+    _, monitoring = pause_state()
     if last_human is None:
         activity = "no human messages found — channel counts as idle"
-        verdict = "would ping on the next check"
+        verdict = "on hold while paused" if _monitoring_paused else "would ping on the next check"
     else:
         ts = last_human.created_at
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=datetime.timezone.utc)
         mins = idle_seconds(ts, now) / 60
         activity = f"last activity {mins:.0f}m ago by {last_human.author}"
-        verdict = "would ping on the next check" if mins >= IDLE_MINUTES else "no ping due yet"
+        if _monitoring_paused:
+            verdict = "on hold while paused"
+        else:
+            verdict = "would ping on the next check" if mins >= IDLE_MINUTES else "no ping due yet"
     await interaction.response.send_message(
         f"Watching <#{CHANNEL_ID}> for <@&{ROLE_ID}>\n"
+        f"Monitoring: {monitoring}\n"
         f"Idle threshold: {IDLE_MINUTES:.0f}m (checked every {CHECK_INTERVAL_SECONDS}s)\n"
         f"{activity} — {verdict}\n"
         f"Messages in rotation: {len(pool)} (source: {pool_source()})",
         ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
+
+
+# --- pause / resume (in-memory; a restart always comes back ACTIVE) ---
+
+_monitoring_paused = False
+_pause_reason: str | None = None
+_pause_until: datetime.datetime | None = None  # aware UTC; None = indefinite
+
+
+def pause_state() -> tuple[bool, str]:
+    """(paused, human-readable description). Timed pauses auto-expire."""
+    global _monitoring_paused, _pause_reason, _pause_until
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if _monitoring_paused and _pause_until is not None and now >= _pause_until:
+        _monitoring_paused = False
+        _pause_reason = None
+        _pause_until = None
+        log.info("Pause expired; monitoring resumed.")
+    if not _monitoring_paused:
+        return False, "ACTIVE"
+    desc = "PAUSED"
+    if _pause_reason:
+        desc += f" ({_pause_reason})"
+    if _pause_until is not None:
+        mins = max(0, int((_pause_until - now).total_seconds() // 60))
+        desc += f", auto-resumes in ~{mins}m"
+    else:
+        desc += ", indefinite"
+    return True, desc
+
+
+@sab_group.command(name="pause", description="Pause idle pinging (managers only)")
+@app_commands.describe(
+    minutes="Auto-resume after this many minutes (omit = stay paused until resumed)",
+    reason="Why it's paused (shown in status)",
+)
+async def sab_pause(
+    interaction: discord.Interaction,
+    minutes: int | None = None,
+    reason: str | None = None,
+) -> None:
+    if not await _require_manager(interaction):
+        return
+    if minutes is not None and minutes <= 0:
+        await interaction.response.send_message("Minutes must be positive.", ephemeral=True)
+        return
+    global _monitoring_paused, _pause_reason, _pause_until
+    _monitoring_paused = True
+    _pause_reason = (reason or "").strip() or None
+    _pause_until = (
+        datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=minutes)
+        if minutes is not None
+        else None
+    )
+    _, desc = pause_state()
+    log.info("Monitoring paused by %s: %s", interaction.user, desc)
+    tail = " Use sab resume to resume early." if minutes is not None else ""
+    await interaction.response.send_message(f"Pinging paused ({desc}).{tail}", ephemeral=True)
+
+
+@sab_group.command(name="resume", description="Resume idle pinging (managers only)")
+async def sab_resume(interaction: discord.Interaction) -> None:
+    if not await _require_manager(interaction):
+        return
+    global _monitoring_paused, _pause_reason, _pause_until
+    was_paused, _ = pause_state()
+    _monitoring_paused = False
+    _pause_reason = None
+    _pause_until = None
+    if was_paused:
+        log.info("Monitoring resumed by %s.", interaction.user)
+        await interaction.response.send_message("Pinging resumed.", ephemeral=True)
+    else:
+        await interaction.response.send_message("It wasn't paused — already active.", ephemeral=True)
 
 
 async def _sync_commands() -> None:
