@@ -72,7 +72,11 @@ PING_MESSAGES_RAW = os.getenv("PING_MESSAGES", "")
 MESSAGE_DELIMITER = os.getenv("MESSAGE_DELIMITER", "||")
 # Option B: one message per line in this file, reloaded on every ping so
 # edits apply without restarting. Blank lines and # comments are ignored.
+# This is the LOCAL file (gitignored): auto-created from the shipped
+# messages.example.txt on first run if missing, never touched by updates.
 MESSAGES_FILE = os.getenv("MESSAGES_FILE", "messages.txt")
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+EXAMPLE_FILE = os.path.join(_BASE_DIR, "messages.example.txt")
 # How far back to scan to find the last non-self message.
 HISTORY_SCAN_LIMIT = int(os.getenv("HISTORY_SCAN_LIMIT", "50"))
 
@@ -207,6 +211,28 @@ async def send_ping(channel: discord.TextChannel, reason: str) -> None:
 _last_sent_message: str | None = None
 
 
+def _ensure_messages_file() -> None:
+    """Seed MESSAGES_FILE from the shipped example if it doesn't exist.
+
+    This is the "ignore if already exists" rule: an existing file is never
+    modified, so local edits survive AMP Updates (the live file is also
+    gitignored, so pulls can't conflict with it either).
+    """
+    if os.path.exists(MESSAGES_FILE):
+        return
+    try:
+        with open(EXAMPLE_FILE, "r", encoding="utf-8") as src:
+            content = src.read()
+    except OSError:
+        return  # no example shipped; caller falls back to PING_TEXT
+    try:
+        with open(MESSAGES_FILE, "w", encoding="utf-8") as dst:
+            dst.write(content)
+        log.info("Created %s from shipped defaults; edit it freely.", MESSAGES_FILE)
+    except OSError as exc:
+        log.warning("Could not seed %s: %s", MESSAGES_FILE, exc)
+
+
 def load_messages() -> list[str]:
     """Resolve the ping-message pool.
 
@@ -220,6 +246,7 @@ def load_messages() -> list[str]:
         if pooled:
             return pooled
         log.warning("PING_MESSAGES set but parsed empty; falling through to %s.", MESSAGES_FILE)
+    _ensure_messages_file()
     try:
         with open(MESSAGES_FILE, "r", encoding="utf-8") as f:
             pooled = []

@@ -1,4 +1,6 @@
 .env
+# Local ping messages (auto-seeded from messages.example.txt, never overwritten by updates)
+messages.txt
 __pycache__/
 *.pyc
 .venv/
