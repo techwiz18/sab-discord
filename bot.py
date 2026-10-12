@@ -608,10 +608,68 @@ async def sab_resume(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("It wasn't paused — already active.", ephemeral=True)
 
 
+# --- runtime frequency config (takes effect immediately, .env wins on restart) ---
+
+MAX_THRESHOLD_MINUTES = 10080.0  # one week
+MIN_INTERVAL_SECONDS = 30
+MAX_INTERVAL_SECONDS = 86400  # one day
+
+
+@sab_group.command(name="threshold", description="Set idle minutes before pinging (managers only)")
+@app_commands.describe(minutes="Minutes of silence before a ping (boot default from .env)")
+async def sab_threshold(interaction: discord.Interaction, minutes: float) -> None:
+    if not await _require_manager(interaction):
+        return
+    if not 0 < minutes <= MAX_THRESHOLD_MINUTES:
+        await interaction.response.send_message(
+            f"Minutes must be over 0 and at most {MAX_THRESHOLD_MINUTES:.0f}.",
+            ephemeral=True,
+        )
+        return
+    global IDLE_MINUTES
+    IDLE_MINUTES = float(minutes)
+    log.info("Idle threshold set to %sm by %s (resets to .env on restart).", minutes, interaction.user)
+    await interaction.response.send_message(
+        f"Idle threshold now {minutes:g}m — effective on the next check "
+        f"(.env default restored on restart).",
+        ephemeral=True,
+    )
+
+
+@sab_group.command(name="interval", description="Set how often the channel is checked (managers only)")
+@app_commands.describe(seconds="Seconds between checks, 30 minimum (boot default from .env)")
+async def sab_interval(interaction: discord.Interaction, seconds: int) -> None:
+    if not await _require_manager(interaction):
+        return
+    if not MIN_INTERVAL_SECONDS <= seconds <= MAX_INTERVAL_SECONDS:
+        await interaction.response.send_message(
+            f"Seconds must be {MIN_INTERVAL_SECONDS}-{MAX_INTERVAL_SECONDS}.",
+            ephemeral=True,
+        )
+        return
+    global CHECK_INTERVAL_SECONDS
+    CHECK_INTERVAL_SECONDS = seconds
+    if inactivity_check.is_running():
+        inactivity_check.change_interval(seconds=seconds)
+    log.info("Check interval set to %ss by %s (resets to .env on restart).", seconds, interaction.user)
+    await interaction.response.send_message(
+        f"Check interval now {seconds}s — effective immediately "
+        f"(.env default restored on restart).",
+        ephemeral=True,
+    )
+
+
 async def _sync_commands() -> None:
     global _commands_synced
     if _commands_synced:
         return
+    names = [c.name for c in tree.get_commands()]
+    log.info(
+        "Registering %d top-level command(s): %s (discord.py %s)",
+        len(names),
+        names,
+        discord.__version__,
+    )
     try:
         if GUILD_ID is not None:
             # Guild-scoped sync lands instantly (global sync can take up to an hour).
