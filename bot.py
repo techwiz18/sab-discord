@@ -774,6 +774,10 @@ async def _sync_commands() -> None:
     try:
         if GUILD_ID is not None:
             # Guild-scoped sync lands instantly (global sync can take up to an hour).
+            # copy_global_to is required: sync(guild=...) only uploads commands
+            # bound to that guild, and ours are registered globally. Without it
+            # the payload is empty and Discord stores (and reports) 0 commands.
+            tree.copy_global_to(guild=discord.Object(id=GUILD_ID))
             synced = await tree.sync(guild=discord.Object(id=GUILD_ID))
             log.info("Synced %d command(s) to guild %s.", len(synced), GUILD_ID)
         else:
