@@ -1001,7 +1001,7 @@ class SetupView(discord.ui.View):
             picked.append(f"Role: <@&{self.role_id}>")
         body = "\n".join(picked) if picked else "Nothing picked yet."
         await interaction.response.edit_message(
-            content=f"Step 1 — pick what to watch (only you can see this):\n{body}",
+            content=f"Step 1 — pick what to watch:\n{body}",
             view=self,
         )
 
@@ -1192,7 +1192,7 @@ async def sab_setup(interaction: discord.Interaction) -> None:
         return
     view = SetupView(owner_id=interaction.user.id)
     await interaction.response.send_message(
-        "Step 1 — pick what to watch (only you can see this):\nNothing picked yet.",
+        "Step 1 — pick what to watch:\nNothing picked yet.",
         view=view,
         ephemeral=True,
     )
