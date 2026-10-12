@@ -17,6 +17,7 @@ import asyncio
 import datetime
 import logging
 import os
+import random
 import sys
 
 # AMP captures stdout through a pipe, where CPython block-buffers by
@@ -66,6 +67,12 @@ GUILD_ID = int(GUILD_ID_RAW) if GUILD_ID_RAW else None
 IDLE_MINUTES = float(os.getenv("IDLE_MINUTES", "60"))
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
 PING_TEXT = os.getenv("PING_TEXT", "Checking in — anything needed here?")
+# Option A: ||-separated messages in .env (takes priority, survives AMP Updates).
+PING_MESSAGES_RAW = os.getenv("PING_MESSAGES", "")
+MESSAGE_DELIMITER = os.getenv("MESSAGE_DELIMITER", "||")
+# Option B: one message per line in this file, reloaded on every ping so
+# edits apply without restarting. Blank lines and # comments are ignored.
+MESSAGES_FILE = os.getenv("MESSAGES_FILE", "messages.txt")
 # How far back to scan to find the last non-self message.
 HISTORY_SCAN_LIMIT = int(os.getenv("HISTORY_SCAN_LIMIT", "50"))
 
@@ -120,6 +127,7 @@ async def on_ready() -> None:
     )
     if GUILD_ID is not None and client.get_guild(GUILD_ID) is None:
         log.warning("GUILD_ID=%s not found in cache; continuing with channel-only mode.", GUILD_ID)
+    log.info("Loaded %d ping message(s).", len(load_messages()))
 
     if not inactivity_check.is_running():
         inactivity_check.change_interval(seconds=CHECK_INTERVAL_SECONDS)
@@ -181,10 +189,11 @@ async def inactivity_check() -> None:
 async def send_ping(channel: discord.TextChannel, reason: str) -> None:
     # Role mention requires the role to be mentionable by the bot
     # (or bot has Mention Everyone perm). <@&id> works without fetching.
-    content = f"<@&{ROLE_ID}> {PING_TEXT}"
+    text = pick_message()
+    content = f"<@&{ROLE_ID}> {text}"
     try:
         await channel.send(content, allowed_mentions=discord.AllowedMentions(roles=True))
-        log.info("Sent idle ping (%s).", reason)
+        log.info("Sent idle ping (%s): %r", reason, text[:80])
     except discord.Forbidden:
         log.error(
             "Missing permission to send/mention in channel %s. Need Send Messages + "
@@ -193,6 +202,54 @@ async def send_ping(channel: discord.TextChannel, reason: str) -> None:
         )
     except discord.HTTPException as exc:
         log.warning("Send ping failed (transient): %s", exc)
+
+
+_last_sent_message: str | None = None
+
+
+def load_messages() -> list[str]:
+    """Resolve the ping-message pool.
+
+    Priority: PING_MESSAGES env (||-separated) -> MESSAGES_FILE
+    (one per line, # comments/blank lines ignored, re-read every ping)
+    -> PING_TEXT fallback. Never returns an empty list.
+    """
+    if PING_MESSAGES_RAW.strip():
+        pooled = [m.strip() for m in PING_MESSAGES_RAW.split(MESSAGE_DELIMITER)]
+        pooled = [m for m in pooled if m]
+        if pooled:
+            return pooled
+        log.warning("PING_MESSAGES set but parsed empty; falling through to %s.", MESSAGES_FILE)
+    try:
+        with open(MESSAGES_FILE, "r", encoding="utf-8") as f:
+            pooled = []
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                pooled.append(line)
+            if pooled:
+                return pooled
+            log.warning("MESSAGES_FILE=%s has no usable lines; using PING_TEXT.", MESSAGES_FILE)
+    except FileNotFoundError:
+        log.debug("MESSAGES_FILE=%s not found; using PING_TEXT.", MESSAGES_FILE)
+    except OSError as exc:
+        log.warning("Could not read MESSAGES_FILE=%s: %s", MESSAGES_FILE, exc)
+    return [PING_TEXT]
+
+
+def pick_message() -> str:
+    """Pick a random message, avoiding an immediate back-to-back repeat."""
+    global _last_sent_message
+    pooled = load_messages()
+    if len(pooled) == 1:
+        choice = pooled[0]
+    else:
+        choice = random.choice(pooled)
+        if choice == _last_sent_message:
+            choice = random.choice(pooled)  # one re-roll is enough
+    _last_sent_message = choice
+    return choice
 
 
 @inactivity_check.before_loop
