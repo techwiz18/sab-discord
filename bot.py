@@ -486,12 +486,12 @@ def remove_file_message(index1: int) -> str:
 
 
 sab_group = app_commands.Group(
-    name="sab", description="SAB activity pinger controls (managers only)"
+    name="sab", description="Pinger controls (server admins only)"
 )
-msg_group = app_commands.Group(name="messages", description="Manage the random ping messages")
+msg_group = app_commands.Group(name="messages", description="Ping messages")
 
 
-@msg_group.command(name="list", description="Show the ping messages currently in rotation (managers only)")
+@msg_group.command(name="list", description="See the current ping messages")
 async def messages_list(interaction: discord.Interaction) -> None:
     if not await _require_manager(interaction):
         return
@@ -505,8 +505,8 @@ async def messages_list(interaction: discord.Interaction) -> None:
     )
 
 
-@msg_group.command(name="add", description="Add a ping message (managers only)")
-@app_commands.describe(text="The message to add to the rotation")
+@msg_group.command(name="add", description="Add a new ping message")
+@app_commands.describe(text="The new message")
 async def messages_add(interaction: discord.Interaction, text: str) -> None:
     if not await _require_manager(interaction):
         return
@@ -541,8 +541,8 @@ async def messages_add(interaction: discord.Interaction, text: str) -> None:
     )
 
 
-@msg_group.command(name="remove", description="Remove a ping message by number (managers only)")
-@app_commands.describe(index="The message number from /messages list")
+@msg_group.command(name="remove", description="Remove a ping message")
+@app_commands.describe(index="Message number from the list")
 async def messages_remove(interaction: discord.Interaction, index: int) -> None:
     if not await _require_manager(interaction):
         return
@@ -563,7 +563,7 @@ tree.add_command(sab_group)
 sab_group.add_command(msg_group)
 
 
-@sab_group.command(name="status", description="Show the inactivity pinger's status (managers only)")
+@sab_group.command(name="status", description="Check if the pinger is working")
 async def sab_status(interaction: discord.Interaction) -> None:
     if not await _require_manager(interaction):
         return
@@ -636,10 +636,10 @@ def pause_state() -> tuple[bool, str]:
     return True, desc
 
 
-@sab_group.command(name="pause", description="Pause idle pinging (managers only)")
+@sab_group.command(name="pause", description="Pause pinging for a while")
 @app_commands.describe(
-    minutes="Auto-resume after this many minutes (omit = stay paused until resumed)",
-    reason="Why it's paused (shown in status)",
+    minutes="Come back after this many minutes (leave empty to stay paused)",
+    reason="Note to show why it's paused",
 )
 async def sab_pause(
     interaction: discord.Interaction,
@@ -665,7 +665,7 @@ async def sab_pause(
     await interaction.response.send_message(f"Pinging paused ({desc}).{tail}", ephemeral=True)
 
 
-@sab_group.command(name="resume", description="Resume idle pinging (managers only)")
+@sab_group.command(name="resume", description="Start pinging again")
 async def sab_resume(interaction: discord.Interaction) -> None:
     if not await _require_manager(interaction):
         return
@@ -684,8 +684,8 @@ async def sab_resume(interaction: discord.Interaction) -> None:
 # --- runtime frequency config (persisted to sab-config.json, .env wins on reset) ---
 
 
-@sab_group.command(name="threshold", description="Set idle minutes before pinging (managers only)")
-@app_commands.describe(minutes="Minutes of silence before a ping (saved, survives restarts)")
+@sab_group.command(name="threshold", description="How long of silence before a ping")
+@app_commands.describe(minutes="Minutes of quiet before the bot pings")
 async def sab_threshold(interaction: discord.Interaction, minutes: float) -> None:
     if not await _require_manager(interaction):
         return
@@ -706,8 +706,8 @@ async def sab_threshold(interaction: discord.Interaction, minutes: float) -> Non
     )
 
 
-@sab_group.command(name="interval", description="Set how often the channel is checked (managers only)")
-@app_commands.describe(seconds="Seconds between checks, 30 minimum (saved, survives restarts)")
+@sab_group.command(name="interval", description="How often to check the channel")
+@app_commands.describe(seconds="Seconds between checks (30 or more)")
 async def sab_interval(interaction: discord.Interaction, seconds: int) -> None:
     if not await _require_manager(interaction):
         return
@@ -730,7 +730,7 @@ async def sab_interval(interaction: discord.Interaction, seconds: int) -> None:
     )
 
 
-@sab_group.command(name="reset", description="Forget saved overrides, restore .env values (managers only)")
+@sab_group.command(name="reset", description="Go back to the default settings")
 async def sab_reset(interaction: discord.Interaction) -> None:
     if not await _require_manager(interaction):
         return
@@ -760,7 +760,7 @@ async def sab_reset(interaction: discord.Interaction) -> None:
         )
 
 
-@sab_group.command(name="emotes", description="List server emotes with codes for ping messages (managers only)")
+@sab_group.command(name="emotes", description="See emotes you can use in messages")
 async def sab_emotes(interaction: discord.Interaction) -> None:
     if not await _require_manager(interaction):
         return
