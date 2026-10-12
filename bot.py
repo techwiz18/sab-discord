@@ -408,11 +408,16 @@ def remove_file_message(index1: int) -> str:
     return removed
 
 
-msg_group = app_commands.Group(name="messages", description="View and manage the random ping messages")
+sab_group = app_commands.Group(
+    name="sab", description="SAB activity pinger controls (managers only)"
+)
+msg_group = app_commands.Group(name="messages", description="Manage the random ping messages")
 
 
-@msg_group.command(name="list", description="Show the ping messages currently in rotation")
+@msg_group.command(name="list", description="Show the ping messages currently in rotation (managers only)")
 async def messages_list(interaction: discord.Interaction) -> None:
+    if not await _require_manager(interaction):
+        return
     pool = load_messages()
     body = "\n".join(f"{i}. {m}" for i, m in enumerate(pool, 1))
     if len(body) > 1800:
@@ -477,11 +482,14 @@ async def messages_remove(interaction: discord.Interaction, index: int) -> None:
     await interaction.response.send_message(f"Removed #{index}: {removed[:200]}", ephemeral=True)
 
 
-tree.add_command(msg_group)
+tree.add_command(sab_group)
+sab_group.add_command(msg_group)
 
 
-@tree.command(name="ping-status", description="Show the inactivity pinger's status")
-async def ping_status(interaction: discord.Interaction) -> None:
+@sab_group.command(name="status", description="Show the inactivity pinger's status (managers only)")
+async def sab_status(interaction: discord.Interaction) -> None:
+    if not await _require_manager(interaction):
+        return
     now = datetime.datetime.now(datetime.timezone.utc)
     try:
         channel = client.get_channel(CHANNEL_ID)
