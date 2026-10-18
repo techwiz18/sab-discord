@@ -1040,8 +1040,9 @@ class SetupView(discord.ui.View):
 
     async def on_timeout(self) -> None:
         try:
-            if self.message is not None:
-                await self.message.edit(content="Setup timed out — run sab setup again.", view=None)
+            message = getattr(self, 'message', None)
+            if message is not None:
+                await message.edit(content="Setup timed out — run sab setup again.", view=None)
         except (discord.Forbidden, discord.HTTPException):
             pass
 
@@ -1141,8 +1142,10 @@ class SetupModal(discord.ui.Modal, title="Ping settings"):
         )
         try:
             await interaction.response.edit_message(content=summary, view=confirm)
+            confirm.message = getattr(interaction, 'message', None)
         except (discord.Forbidden, discord.HTTPException):
-            await interaction.followup.send(summary, view=confirm, ephemeral=True)
+            sent = await interaction.followup.send(summary, view=confirm, ephemeral=True)
+            confirm.message = sent
 
     async def on_error(
         self, interaction: discord.Interaction, error: Exception
@@ -1178,8 +1181,9 @@ class ConfirmView(discord.ui.View):
 
     async def on_timeout(self) -> None:
         try:
-            if self.message is not None:
-                await self.message.edit(
+            message = getattr(self, 'message', None)
+            if message is not None:
+                await message.edit(
                     content="Setup timed out — nothing was changed. Run sab setup again.",
                     view=None,
                 )
@@ -1250,6 +1254,10 @@ async def sab_setup(interaction: discord.Interaction) -> None:
         view=view,
         ephemeral=True,
     )
+    try:
+        view.message = await interaction.original_response()
+    except (discord.Forbidden, discord.HTTPException):
+        pass
 
 
 @sab_group.command(name="emotes", description="See emotes you can use in messages")
