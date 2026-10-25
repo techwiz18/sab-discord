@@ -1,9 +1,9 @@
 """Single-purpose Discord inactivity pinger.
 
 Watches one channel. If no real activity for IDLE_MINUTES or more,
-pings one role. Timer resets on any non-self message; the bot's own
-pings never reset the timer, so a still-idle channel gets re-pinged
-every IDLE_MINUTES.
+pings one role. Timer resets on any message, including the bot's own
+pings, so a still-idle channel gets re-pinged every IDLE_MINUTES
+rather than on every check.
 
 Designed for CubeCoders AMP -> Python App Runner:
   App Run Mode: Python script
@@ -97,8 +97,6 @@ MESSAGE_DELIMITER = os.getenv("MESSAGE_DELIMITER", "||")
 MESSAGES_FILE = os.getenv("MESSAGES_FILE", "messages.txt")
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EXAMPLE_FILE = os.path.join(_BASE_DIR, "messages.example.txt")
-# How far back to scan to find the last non-self message.
-HISTORY_SCAN_LIMIT = int(os.getenv("HISTORY_SCAN_LIMIT", "50"))
 
 if IDLE_MINUTES <= 0:
     log.error("IDLE_MINUTES must be > 0")
@@ -215,13 +213,9 @@ def idle_seconds(last_activity: datetime.datetime, now: datetime.datetime) -> fl
     return (now - last_activity).total_seconds()
 
 
-async def find_last_human_message(
-    channel: discord.TextChannel, self_id: int | None
-) -> discord.Message | None:
-    """Return newest message in channel not sent by this bot, or None."""
-    async for msg in channel.history(limit=HISTORY_SCAN_LIMIT):
-        if self_id is not None and msg.author.id == self_id:
-            continue
+async def find_last_message(channel: discord.TextChannel) -> discord.Message | None:
+    """Return the newest message in the channel, including our own pings."""
+    async for msg in channel.history(limit=1):
         return msg
     return None
 
@@ -291,19 +285,19 @@ async def inactivity_check() -> None:
         return
 
     try:
-        last_human = await find_last_human_message(channel, client.user.id)
+        last_message = await find_last_message(channel)
     except (discord.Forbidden, discord.HTTPException) as exc:
         log.warning("History read failed: %s", exc)
         return
 
-    if last_human is None:
-        # Channel has only our own pings (or is empty) within scan window:
-        # treat as idle so a first/repeat ping still goes out.
-        log.info("No human messages in last %d; treating channel as idle.", HISTORY_SCAN_LIMIT)
-        await send_ping(channel, reason="no-human-history")
+    if last_message is None:
+        # Channel is empty (or unreadable history): treat as idle so a
+        # first/repeat ping still goes out.
+        log.info("No messages in channel; treating channel as idle.")
+        await send_ping(channel, reason="no-history")
         return
 
-    last_ts = last_human.created_at
+    last_ts = last_message.created_at
     if last_ts.tzinfo is None:
         last_ts = last_ts.replace(tzinfo=datetime.timezone.utc)
     idle_min = idle_seconds(last_ts, now) / 60.0
@@ -313,7 +307,7 @@ async def inactivity_check() -> None:
             "Channel idle %.1fm (>= %.1fm, last by %s at %s). Pinging role %s.",
             idle_min,
             IDLE_MINUTES,
-            last_human.author,
+            last_message.author,
             last_ts.isoformat(),
             ROLE_ID,
         )
@@ -637,7 +631,7 @@ async def sab_status(interaction: discord.Interaction) -> None:
             channel = await client.fetch_channel(CHANNEL_ID)
         if not isinstance(channel, discord.TextChannel):
             raise discord.NotFound("watched channel", "not a text channel")
-        last_human = await find_last_human_message(channel, client.user.id if client.user else None)
+        last_message = await find_last_message(channel)
     except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
         await interaction.response.send_message(
             f"Can't read the watched channel: {exc}", ephemeral=True
@@ -645,15 +639,15 @@ async def sab_status(interaction: discord.Interaction) -> None:
         return
     pool = load_messages()
     _, monitoring = pause_state()
-    if last_human is None:
-        activity = "no human messages found — channel counts as idle"
+    if last_message is None:
+        activity = "no messages found — channel counts as idle"
         verdict = "on hold while paused" if _monitoring_paused else "would ping on the next check"
     else:
-        ts = last_human.created_at
+        ts = last_message.created_at
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=datetime.timezone.utc)
         mins = idle_seconds(ts, now) / 60
-        activity = f"last activity {mins:.0f}m ago by {last_human.author}"
+        activity = f"last activity {mins:.0f}m ago by {last_message.author}"
         if _monitoring_paused:
             verdict = "on hold while paused"
         else:
